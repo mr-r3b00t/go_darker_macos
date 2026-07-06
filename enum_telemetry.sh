@@ -67,9 +67,11 @@ backup_plists() {
     [[ $BACKED_UP -eq 1 ]] && return 0
     mkdir -p "$BACKUP_DIR"
     local p
+    # Container plist gets a distinct name — same basename as the fallback plist
+    [[ -r "$SAFARI_CONTAINER" ]] && \
+        cp "$SAFARI_CONTAINER" "$BACKUP_DIR/com.apple.Safari.container.plist" 2>/dev/null
     for p in \
         "$DMH" \
-        "$SAFARI_CONTAINER" \
         "$HOME/Library/Preferences/com.apple.Safari.plist" \
         "$HOME/Library/Preferences/com.apple.assistant.support.plist" \
         "$HOME/Library/Preferences/com.apple.AdLib.plist" \
@@ -126,7 +128,6 @@ status_6() {  # Fraudulent-site warning — informational, ON is the default
 harden_1() {
     echo "Disabling system-wide diagnostics submission (requires sudo)..."
     backup_plists
-    sudo cp "$DMH" "$BACKUP_DIR/DiagnosticMessagesHistory.plist" 2>/dev/null
     sudo defaults write "$DMH" AutoSubmit            -bool false && \
     sudo defaults write "$DMH" ThirdPartyDataSubmit  -bool false && \
     sudo defaults write "$DMH" SeedAutoSubmit        -bool false && \
@@ -147,32 +148,44 @@ harden_3() {
     defaults write com.apple.AdLib forceLimitAdTracking -bool true && \
     echo "$(ok 'Done'): personalized ads off, Limit Ad Tracking forced." || echo "$(bad 'Failed')"
 }
+# safari_post_write <key> <expected> — verify a representative key stuck, and
+# warn about cfprefsd caching when writing the container plist by file path.
+safari_post_write() {
+    if [[ "$(dread "$SAFARI" "$1")" == "$2" ]]; then
+        echo "$(ok 'Verified'): settings written. Restart Safari to take effect."
+        [[ "$SAFARI" != "com.apple.Safari" ]] && \
+            echo "$(warn 'Note:') if a setting later reverts, run 'killall cfprefsd' (its cache can overwrite direct plist writes)."
+    else
+        echo "$(bad 'Warning'): re-read did not return the expected value — settings may not have stuck."
+    fi
+    [[ "$SAFARI" == "com.apple.Safari" ]] && \
+        echo "$(warn 'Note:') no Full Disk Access — verify in Safari settings that these stuck."
+}
 harden_4() {
     echo "Disabling Safari search & suggestions telemetry..."
     backup_plists
     safari_quit_check
-    defaults write "$SAFARI" UniversalSearchEnabled        -bool false
-    defaults write "$SAFARI" SuppressSearchSuggestions     -bool true
-    defaults write "$SAFARI" WebsiteSpecificSearchEnabled  -bool false
-    defaults write "$SAFARI" PreloadTopHit                 -bool false
-    echo "$(ok 'Done'): Safari Suggestions, search suggestions, Quick Website Search,"
-    echo "      and Top Hit preloading disabled. Restart Safari to take effect."
-    [[ "$SAFARI" == "com.apple.Safari" ]] && \
-        echo "$(warn 'Note:') no Full Disk Access — verify in Safari settings that these stuck."
+    defaults write "$SAFARI" UniversalSearchEnabled        -bool false && \
+    defaults write "$SAFARI" SuppressSearchSuggestions     -bool true  && \
+    defaults write "$SAFARI" WebsiteSpecificSearchEnabled  -bool false && \
+    defaults write "$SAFARI" PreloadTopHit                 -bool false || \
+        { echo "$(bad 'Failed'): could not write Safari preferences."; return 1; }
+    echo "Safari Suggestions, search suggestions, Quick Website Search, and Top Hit preloading disabled."
+    safari_post_write UniversalSearchEnabled 0
 }
 harden_5() {
     echo "Enabling Safari tracking protections / disabling ad measurement..."
     backup_plists
     safari_quit_check
-    defaults write "$SAFARI" WebKitPreferences.privateClickMeasurementEnabled -bool false
-    defaults write "$SAFARI" EnableEnhancedPrivacyInRegularBrowsing -bool true
-    defaults write "$SAFARI" EnableEnhancedPrivacyInPrivateBrowsing -bool true
-    defaults write "$SAFARI" BlockStoragePolicy -int 2
-    defaults write "$SAFARI" WebKitStorageBlockingPolicy -int 1
-    echo "$(ok 'Done'): Private Click Measurement off, advanced tracking & fingerprinting"
-    echo "      protection on (all browsing), third-party storage blocked. Restart Safari."
-    [[ "$SAFARI" == "com.apple.Safari" ]] && \
-        echo "$(warn 'Note:') no Full Disk Access — verify in Safari settings that these stuck."
+    defaults write "$SAFARI" WebKitPreferences.privateClickMeasurementEnabled -bool false && \
+    defaults write "$SAFARI" EnableEnhancedPrivacyInRegularBrowsing -bool true && \
+    defaults write "$SAFARI" EnableEnhancedPrivacyInPrivateBrowsing -bool true && \
+    defaults write "$SAFARI" BlockStoragePolicy -int 2 && \
+    defaults write "$SAFARI" WebKitStorageBlockingPolicy -int 1 || \
+        { echo "$(bad 'Failed'): could not write Safari preferences."; return 1; }
+    echo "Private Click Measurement off, advanced tracking & fingerprinting protection"
+    echo "on (all browsing), third-party storage blocked."
+    safari_post_write EnableEnhancedPrivacyInRegularBrowsing 1
 }
 harden_6() {
     echo "Fraudulent-site warning checks URLs against Google Safe Browsing (Tencent in"
@@ -181,7 +194,8 @@ harden_6() {
         backup_plists
         safari_quit_check
         defaults write "$SAFARI" WarnAboutFraudulentWebsites -bool false && \
-        echo "$(ok 'Done'): fraudulent-site warning disabled."
+        echo "$(ok 'Done'): fraudulent-site warning disabled." || \
+        echo "$(bad 'Failed'): could not write Safari preferences."
     else
         echo "Left unchanged."
     fi
@@ -255,7 +269,11 @@ show_status() {
     print_key "$SAFARI" WarnAboutFraudulentWebsites  "Fraudulent-site warning (Safe Browsing)"
 
     section "MDM / Configuration Profiles"
-    profiles list 2>/dev/null | sed 's/^/  /' || echo "  run 'sudo profiles show' for full output"
+    if profiles list &>/dev/null; then
+        profiles list 2>/dev/null | sed 's/^/  /'
+    else
+        echo "  'profiles list' failed — run 'sudo profiles show' for full output"
+    fi
     echo
 }
 
@@ -264,11 +282,11 @@ show_status() {
 # ---------------------------------------------------------------------------
 # row <domain> <key> <recommended> <description>
 row() {
-    local cur=$(dread "$1" "$2") mark
+    local cur mark; cur=$(dread "$1" "$2")
     if [[ "$cur" == "$3" ]]; then
-        mark=$(ok '  ok  ')
+        mark=$(ok '  ok   ')
     elif [[ "$cur" == "unset" ]]; then
-        cur="-" ; mark=$(warn 'unset ')
+        cur="-" ; mark=$(warn ' unset ')
     else
         mark=$(bad 'differs')
     fi
@@ -336,7 +354,7 @@ menu() {
         printf '  6) Safari fraudulent-site warning (tradeoff) .... %s\n' "$(colour_status "$(status_6)")"
         printf '\n  a) Harden ALL (1-5)    v) View all settings    s) Full status report    q) Quit\n\n'
         local choice
-        read -r -p "Select item to harden [1-6/a/v/s/q]: " choice
+        read -r -p "Select item to harden [1-6/a/v/s/q]: " choice || { echo; break; }
         echo
         case "$choice" in
             1) harden_1 ;;
